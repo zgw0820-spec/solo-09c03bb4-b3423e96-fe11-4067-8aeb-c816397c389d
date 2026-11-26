@@ -282,6 +282,112 @@ async def test_crd_status_conflict_is_retried_and_converges(client, stub_client,
     assert report["storedVersionsAfter"] == ["v1"]
 
 
+async def test_crd_conditions_survive_flag_removal(client, stub_client):
+    # 正常撤标也不得清掉 CRD status 的其他字段（conditions 必须原样保留）
+    report = (await client.post("/migrate")).json()
+    assert report["status"] == "succeeded"
+    view = await _storage(stub_client)
+    condition_types = [c["type"] for c in view["crdConditions"]]
+    assert "Established" in condition_types
+    assert view["storedVersions"] == ["v1"]
+
+
+async def test_status_conflict_keeps_concurrently_written_condition(client, stub_client):
+    # 首次 CRD /status PUT 时，替身让另一控制器先写入 NamesAccepted condition
+    # 并推进 resourceVersion，本次 PUT 得到 409；迁移必须重读最新 CRD 再判断，
+    # 最终收敛时保留别人刚写入的 condition，而不是拿旧快照覆盖。
+    await stub_client.put("/__control/hooks", json={
+        "crdStatusConflictOnce": {"mode": "condition-write"}
+    })
+    report = (await client.post("/migrate")).json()
+    assert report["status"] == "succeeded", report
+    assert report["legacyVersionOutcome"] == "removed"
+    assert report["storedVersionsAfter"] == ["v1"]
+
+    view = await _storage(stub_client)
+    condition_types = [c["type"] for c in view["crdConditions"]]
+    assert condition_types == ["Established", "NamesAccepted"]  # 并发 condition 未丢
+    assert view["storedVersions"] == ["v1"]
+    assert view["crdStatusPutCount"] == 1  # 仅一次成功的状态写
+
+
+async def test_externally_removed_flag_is_reported_not_rewritten_via_hook(client, stub_client):
+    # 409 竞争中，另一控制器已抢先撤掉 v1beta1：重读后应报告标记已不存在，
+    # 且不再执行任何 CRD 状态写。
+    await stub_client.put("/__control/hooks", json={
+        "crdStatusConflictOnce": {"mode": "external-removal"}
+    })
+    report = (await client.post("/migrate")).json()
+    assert report["status"] == "succeeded", report
+    assert report["legacyVersionRemoved"] is False
+    assert report["legacyVersionOutcome"] == "already-absent"
+    assert report["storedVersionsAfter"] == ["v1"]
+
+    view = await _storage(stub_client)
+    assert view["storedVersions"] == ["v1"]
+    assert view["crdStatusPutCount"] == 0  # 没有再写状态
+    assert "NamesAccepted" in [c["type"] for c in view["crdConditions"]]
+
+
+async def test_externally_removed_flag_before_convergence_needs_no_write(client, stub_client):
+    # 无冲突路径：对象改存期间旧标记已被别处撤掉，收敛阶段重读即发现缺失
+    from app.stub.store import V1
+
+    async def fake_get_crd(self):  # noqa: ANN001
+        crd = await store.get_crd()
+        crd["status"]["storedVersions"] = [V1]
+        return crd
+
+    from app.k8s import KubernetesClient
+
+    real_get = KubernetesClient.get_crd
+    KubernetesClient.get_crd = fake_get_crd  # type: ignore[method-assign]
+    try:
+        report = (await client.post("/migrate")).json()
+    finally:
+        KubernetesClient.get_crd = real_get  # type: ignore[method-assign]
+
+    assert report["status"] == "succeeded", report
+    assert report["legacyVersionOutcome"] == "already-absent"
+    view = await _storage(stub_client)
+    assert view["crdStatusPutCount"] == 0
+
+
+async def test_recreated_crd_uid_change_fails_without_writing_new_crd(client, stub_client):
+    # 首次 CRD /status PUT 时，替身模拟同名 CRD 被删除并重建（新 UID）：
+    # 迁移必须报失败，绝不写新 CRD 的状态；对象改存流程本身已照常完成。
+    await stub_client.put("/__control/hooks", json={
+        "crdRecreateOnce": {"storedVersions": ["v1beta1", "v1"]}
+    })
+    report = (await client.post("/migrate")).json()
+    assert report["status"] == "failed"
+    assert report["crdUidChanged"] is True
+    assert report["error"]["stage"] == "update-crd-status"
+    assert report["legacyVersionRemoved"] is False
+    assert report["legacyVersionOutcome"] == "retained"
+
+    view = await _storage(stub_client)
+    assert view["crdStatusPutCount"] == 0  # 新 CRD 从未被本服务写状态
+    assert view["storedVersions"] == ["v1beta1", "v1"]  # 新 CRD 标记原样未动
+    # 对象改存不受影响：三个对象仍按 v1 落盘
+    assert {o["storageVersion"] for o in view["objects"]} == {"v1"}
+    assert report["objectsRewritten"] == 3
+
+
+async def test_recreated_crd_with_flag_already_gone_still_fails_on_uid(client, stub_client):
+    # 即便新 CRD 的 storedVersions 里已经没有 v1beta1，UID 变了也必须失败，
+    # 不能把“标记不存在”当成成功，更不能写新对象。
+    await stub_client.put("/__control/hooks", json={
+        "crdRecreateOnce": {"storedVersions": ["v1"]}
+    })
+    report = (await client.post("/migrate")).json()
+    assert report["status"] == "failed"
+    assert report["crdUidChanged"] is True
+    assert report["legacyVersionOutcome"] == "retained"
+    view = await _storage(stub_client)
+    assert view["crdStatusPutCount"] == 0
+
+
 async def test_concurrent_migrations_rejected(client):
     import asyncio
 

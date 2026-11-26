@@ -2,12 +2,20 @@
 
 流程严格对齐 Kubernetes 官方 storage version migrator 的思路：
 1. 校验 CRD 存在、集群级、唯一 storage=true 的版本是 v1，且 storedVersions 含 v1beta1；
+   同时记录本轮开始时 CRD 的 UID；
 2. 用 v1 分页 LIST 全部对象（continue 翻页直到无 next token）；
 3. 对每个对象：GET 到的 v1 表示原样 PUT 回去（只换 resourceVersion 驱动重写），
    服务端按当前存储版本 v1 重新落盘 —— 不修改 spec/status 的任何内容；
 4. 409 冲突 => 重新 GET 最新对象再试；404 => 对象已删除，跳过且不补建；
 5. 只有遍历完整、且所有未删除对象都成功改存后，才把 v1beta1 从
    CRD status.storedVersions 移除；任一步失败且不可继续 => 保留旧标记并报错。
+
+CRD 撤标的安全约束（只针对本轮开始时的那个 CRD）：
+- PUT /status 携带最新 GET 到的完整 status，只改 storedVersions，conditions 等
+  其他状态字段原样保留，绝不用只有 storedVersions 的 body 整体覆盖；
+- 409 => 丢弃旧快照，重读最新 CRD 重新判断，不覆盖其他控制器刚写入的状态；
+- 重读发现 v1beta1 已被别处撤掉 => 报告 already-absent，不再写状态；
+- 重读发现 UID 变了（同名 CRD 被重建）=> 报 failed 且不写新 CRD 的任何状态。
 """
 from __future__ import annotations
 
@@ -36,6 +44,10 @@ class MigrationReport:
     crd: str = config.CRD_NAME
     storageVersion: str = config.STORAGE_VERSION
     legacyVersionRemoved: bool = False
+    # 旧标记的最终处置：removed（本轮成功撤标）| already-absent（别处已撤）|
+    # retained（出错保留，可重跑）
+    legacyVersionOutcome: str = "retained"
+    crdUidChanged: bool = False
     storedVersionsBefore: list[str] = field(default_factory=list)
     storedVersionsAfter: list[str] = field(default_factory=list)
     pagesProcessed: int = 0
@@ -149,6 +161,9 @@ async def run_migration(client: KubernetesClient | None = None) -> dict:
 
         before = list(crd.get("status", {}).get("storedVersions", []))
         report.storedVersionsBefore = before
+        # 本轮开始时那个 CRD 的身份。后续任何状态写回都必须确认 UID 未变：
+        # 若改存期间同名 CRD 被删除并重建，得到的是一个全新对象，绝不能写它。
+        original_uid = crd.get("metadata", {}).get("uid")
         if config.LEGACY_VERSION not in before:
             # 幂等：没有旧标记时仍可重跑（把残留 v1beta1 编码对象改存），但无需再改 CRD
             logger.info("legacy version %s absent from storedVersions: %s",
@@ -200,30 +215,77 @@ async def run_migration(client: KubernetesClient | None = None) -> dict:
             return report.to_dict()
 
         # -------------------------------- 4. 收敛 CRD status.storedVersions
+        # 只在本轮开始时旧标记确实存在时才动 CRD；撤标原则：
+        #  - 只从“本轮开始时那个 CRD”的 status.storedVersions 里删 v1beta1，
+        #    其他版本与 status 的其余字段（conditions 等）全部原样保留；
+        #  - 409 => 重读最新 CRD 重新判断，不拿旧快照覆盖其他控制器刚写入的状态；
+        #  - 重读发现 v1beta1 已被别处撤掉 => 报告标记已不存在，不再写状态；
+        #  - 重读发现 UID 变了（同名 CRD 被重建）=> 报失败，绝不写新 CRD。
         if config.LEGACY_VERSION in before:
             crd_attempts = 0
             while True:
                 try:
                     latest_crd = await client.get_crd()
-                    desired = [
-                        v for v in latest_crd["status"]["storedVersions"]
-                        if v != config.LEGACY_VERSION
-                    ]
-                    if config.STORAGE_VERSION not in desired:
-                        desired.append(config.STORAGE_VERSION)
-                    latest_crd["status"]["storedVersions"] = desired
-                    updated = await client.put_crd_status(latest_crd)
-                    report.legacyVersionRemoved = True
+                except ApiError as exc:
+                    report.error = {
+                        "stage": "update-crd-status",
+                        "message": f"重读最新 CRD 失败: {exc.message}",
+                        "status": exc.status,
+                        "hint": "对象改存已完成，旧标记仍保留，重跑本接口即可安全重试",
+                    }
+                    report.storedVersionsAfter = before
+                    return report.to_dict()
+
+                latest_meta = latest_crd.get("metadata", {})
+                if latest_meta.get("uid") != original_uid:
+                    # 同名 CRD 被删除后重建：新对象不是本轮改存对应的那个，
+                    # 不写它的任何状态，按失败上报（对象改存结果仍在报告中）。
+                    report.crdUidChanged = True
+                    report.error = {
+                        "stage": "update-crd-status",
+                        "message": (
+                            f"CRD {config.CRD_NAME} 的 UID 已变化"
+                            f"（开始时 {original_uid!r}，现在 {latest_meta.get('uid')!r}），"
+                            "疑似改存期间同名 CRD 被删除并重建；拒绝写入新 CRD 的状态"
+                        ),
+                        "hint": "请人工确认新 CRD 的 storedVersions 与对象落盘情况后再决定是否重跑",
+                    }
                     report.storedVersionsAfter = list(
-                        updated["status"]["storedVersions"]
+                        latest_crd.get("status", {}).get("storedVersions", [])
+                    )
+                    return report.to_dict()
+
+                latest_versions = list(
+                    latest_crd.get("status", {}).get("storedVersions", [])
+                )
+                if config.LEGACY_VERSION not in latest_versions:
+                    # 旧标记已被别的组件撤掉：不重复写状态，按事实报告。
+                    report.legacyVersionRemoved = False
+                    report.legacyVersionOutcome = "already-absent"
+                    report.storedVersionsAfter = latest_versions
+                    logger.info(
+                        "legacy version %s already removed from storedVersions by another "
+                        "component; no CRD status write performed",
+                        config.LEGACY_VERSION,
                     )
                     break
+
+                # 仅从最新 storedVersions 中剔除 v1beta1，其余版本保持原顺序原样保留；
+                # status 的其他字段（conditions 等）随 latest_crd 完整回写。
+                desired = [v for v in latest_versions if v != config.LEGACY_VERSION]
+                if config.STORAGE_VERSION not in desired:
+                    desired.append(config.STORAGE_VERSION)
+                latest_crd["status"]["storedVersions"] = desired
+                try:
+                    updated = await client.put_crd_status(latest_crd)
                 except ApiError as exc:
                     if exc.status == 409 and crd_attempts < config.MAX_CONFLICT_RETRIES:
-                        # CRD status 也被其他组件改动：重读最新版本再试
+                        # CRD status 也被其他组件改动：丢弃本次基于旧 resourceVersion
+                        # 的构造，下一轮重读最新 CRD 再重新判断（UID / 标记是否还在）。
                         crd_attempts += 1
                         logger.warning(
-                            "conflict updating CRD status, retry %d/%d",
+                            "conflict updating CRD status, re-read and re-evaluate "
+                            "retry %d/%d",
                             crd_attempts, config.MAX_CONFLICT_RETRIES,
                         )
                         await asyncio.sleep(
@@ -239,7 +301,14 @@ async def run_migration(client: KubernetesClient | None = None) -> dict:
                     }
                     report.storedVersionsAfter = before
                     return report.to_dict()
+                report.legacyVersionRemoved = True
+                report.legacyVersionOutcome = "removed"
+                report.storedVersionsAfter = list(
+                    updated["status"]["storedVersions"]
+                )
+                break
         else:
+            report.legacyVersionOutcome = "already-absent"
             report.storedVersionsAfter = before
 
         report.status = "succeeded"

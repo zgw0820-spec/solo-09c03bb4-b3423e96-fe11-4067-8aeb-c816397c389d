@@ -59,4 +59,34 @@ curl -fsS -X POST "$MIGRATOR/migrate" | jq '{status, error, legacyVersionRemoved
 curl -fsS -X PUT "$STUB/__control/hooks" -H 'Content-Type: application/json' -d '{}' >/dev/null
 curl -fsS -X POST "$MIGRATOR/migrate" | jq '{status, storedVersionsAfter, objectsRewritten}'
 
+p "6. CRD 状态冲突：另一控制器先写 condition 并推进 resourceVersion，迁移 409 后重读最新状态再撤标"
+curl -fsS -X POST "$STUB/__control/reset" >/dev/null
+curl -fsS -X PUT "$STUB/__control/hooks" -H 'Content-Type: application/json' \
+  -d '{"crdStatusConflictOnce": {"mode": "condition-write"}}' >/dev/null
+curl -fsS -X POST "$MIGRATOR/migrate" \
+  | jq '{status, legacyVersionOutcome, legacyVersionRemoved, storedVersionsAfter}'
+# 别人刚写入的 NamesAccepted condition 必须保留，Established 也不能被撤标清掉；
+# crdStatusPutCount=1 表示冲突后只成功写过一次状态
+curl -fsS "$STUB/__control/storage" \
+  | jq '{storedVersions, crdStatusPutCount, conditionTypes: [.crdConditions[].type]}'
+
+p "7a. 冲突中旧标记已被别处撤掉：报告 already-absent，不再写任何 CRD 状态"
+curl -fsS -X POST "$STUB/__control/reset" >/dev/null
+curl -fsS -X PUT "$STUB/__control/hooks" -H 'Content-Type: application/json' \
+  -d '{"crdStatusConflictOnce": {"mode": "external-removal"}}' >/dev/null
+curl -fsS -X POST "$MIGRATOR/migrate" \
+  | jq '{status, legacyVersionOutcome, legacyVersionRemoved, storedVersionsAfter}'
+curl -fsS "$STUB/__control/storage" \
+  | jq '{storedVersions, crdStatusPutCount, conditionTypes: [.crdConditions[].type]}'
+
+p "7b. 同名 CRD 改存期间被重建（UID 变化）：报失败且绝不写新 CRD，对象改存仍已完成"
+curl -fsS -X POST "$STUB/__control/reset" >/dev/null
+curl -fsS -X PUT "$STUB/__control/hooks" -H 'Content-Type: application/json' \
+  -d '{"crdRecreateOnce": {"storedVersions": ["v1beta1", "v1"]}}' >/dev/null
+curl -fsS -X POST "$MIGRATOR/migrate" \
+  | jq '{status, crdUidChanged, legacyVersionOutcome, error, objectsRewritten}'
+# 新 CRD 的 storedVersions 原样未动、本服务对它的状态写次数为 0；对象仍是 v1
+curl -fsS "$STUB/__control/storage" \
+  | jq '{storedVersions, crdStatusPutCount, objectStorageVersions: [.objects[].storageVersion]}'
+
 p "演示完成"

@@ -88,12 +88,15 @@ class KubernetesClient:
             "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/"
             f"{config.CRD_NAME}/status"
         )
-        # 状态子资源写回：仅携带 metadata + status
+        # 状态子资源写回：apiserver 会用 body.status 整体替换 CRD status，
+        # 因此必须携带最新 GET 到的完整 status（含 conditions、acceptedNames
+        # 等），只允许 storedVersions 与最新版本不同，其余字段原样回写，
+        # 绝不能只发 storedVersions —— 那会清掉其他控制器维护的状态字段。
         body = {
             "apiVersion": "apiextensions.k8s.io/v1",
             "kind": "CustomResourceDefinition",
             "metadata": {"name": config.CRD_NAME, "resourceVersion": crd["metadata"]["resourceVersion"]},
-            "status": {"storedVersions": crd["status"]["storedVersions"]},
+            "status": crd["status"],
         }
         return await self._request_with_retry("PUT", path, json=body)
 

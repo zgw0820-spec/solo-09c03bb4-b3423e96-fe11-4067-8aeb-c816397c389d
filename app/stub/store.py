@@ -184,6 +184,8 @@ class StubStore:
         self._objects = _seed_policies()
         self._crd = _crd_object([V1BETA1, V1])
         self._global_rv = 200
+        # 成功的 CRD /status PUT 次数（演示/测试用来确认“没有再写状态”）
+        self._crd_status_puts = 0
         # 故障钩子：见 README/控制接口说明
         self.hooks: dict[str, Any] = {}
 
@@ -224,6 +226,29 @@ class StubStore:
             hook.get("message", f"injected {kind} failure"),
         )
 
+    # ------------------------------------------------- CRD 并发场景辅助
+    def _bump_crd_locked(self, extra_conditions: list[dict] | None = None) -> None:
+        """模拟其他控制器对 CRD 的一次并发 status 写：递增 RV、追加 condition。"""
+        self._bump_rv_locked()
+        self._crd["metadata"]["resourceVersion"] = str(self._global_rv)
+        if extra_conditions:
+            existing = {c["type"] for c in self._crd["status"].get("conditions", [])}
+            for cond in extra_conditions:
+                if cond["type"] in existing:
+                    for cur in self._crd["status"]["conditions"]:
+                        if cur["type"] == cond["type"]:
+                            cur.update(cond)
+                else:
+                    self._crd["status"].setdefault("conditions", []).append(cond)
+
+    def _crd_hook_once(self, kind: str) -> dict | None:
+        """读取一次性 CRD 钩子；已用过则返回 None。"""
+        hook = self.hooks.get(kind)
+        if not hook or hook.get("used"):
+            return None
+        hook["used"] = True
+        return hook
+
     # ------------------------------------------------------------------- CRD
     async def get_crd(self) -> dict:
         async with self._lock:
@@ -231,6 +256,27 @@ class StubStore:
 
     async def put_crd_status(self, body: dict) -> dict:
         async with self._lock:
+            # 注入：本次 CRD /status PUT 前，另一个控制器先改了 CRD（改 RV），
+            # 模拟 storedVersions 收敛与其他控制器 status 写之间的 409 竞争
+            conflict = self._crd_hook_once("crdStatusConflictOnce")
+            if conflict is not None:
+                mode = conflict.get("mode", "condition-write")
+                if mode in ("condition-write", "external-removal"):
+                    self._bump_crd_locked([
+                        {
+                            "type": "NamesAccepted",
+                            "status": "True",
+                            "lastTransitionTime": _now(),
+                            "reason": "NoConflicts",
+                            "message": "injected concurrent condition by another controller",
+                        }
+                    ])
+                if mode == "external-removal":
+                    # 其他控制器已抢先把 v1beta1 从 storedVersions 撤掉
+                    self._crd["status"]["storedVersions"] = [
+                        v for v in self._crd["status"]["storedVersions"] if v != V1BETA1
+                    ]
+
             rv = body.get("metadata", {}).get("resourceVersion")
             if rv != self._crd["metadata"]["resourceVersion"]:
                 raise ApiException(
@@ -239,7 +285,10 @@ class StubStore:
                     f"Operation cannot be fulfilled on customresourcedefinitions \"{CRD_NAME}\": "
                     "the object has been modified; please apply your changes to the latest version",
                 )
-            stored = body.get("status", {}).get("storedVersions")
+            new_status = body.get("status")
+            if not isinstance(new_status, dict):
+                raise ApiException(422, "Invalid", "status body required")
+            stored = new_status.get("storedVersions")
             if not isinstance(stored, list) or not stored:
                 raise ApiException(
                     422, "Invalid", "status.storedVersions must be a non-empty array"
@@ -247,9 +296,28 @@ class StubStore:
             # 仅允许收敛到 v1（替身只模拟这一条迁移路径）
             if any(v not in (V1, V1BETA1) for v in stored):
                 raise ApiException(422, "Invalid", f"unexpected storedVersions: {stored}")
+
+            # 注入：同名 CRD 在本轮改存期间被删除并重建（UID 变化）。
+            # 放在 RV 校验之后，模拟迁移服务读到的下一个 GET 即会看到新对象。
+            recreated = self._crd_hook_once("crdRecreateOnce")
+            if recreated is not None:
+                seed_versions = recreated.get("storedVersions", [V1BETA1, V1])
+                self._crd = _crd_object(seed_versions)
+                self._bump_rv_locked()
+                self._crd["metadata"]["resourceVersion"] = str(self._global_rv)
+                raise ApiException(
+                    409,
+                    "Conflict",
+                    f"Operation cannot be fulfilled on customresourcedefinitions \"{CRD_NAME}\": "
+                    "the object has been modified; please apply your changes to the latest version",
+                )
+
+            # 与真实 apiserver 一致：/status 用 body.status 整体替换 CRD 的
+            # status（conditions 等字段也以请求体为准），spec 不受影响。
             self._bump_rv_locked()
-            self._crd["status"]["storedVersions"] = list(stored)
+            self._crd["status"] = deepcopy(new_status)
             self._crd["metadata"]["resourceVersion"] = str(self._global_rv)
+            self._crd_status_puts += 1
             return deepcopy(self._crd)
 
     # ------------------------------------------------------------- CR list/get
@@ -390,6 +458,10 @@ class StubStore:
                 )
             return {
                 "storedVersions": list(self._crd["status"]["storedVersions"]),
+                "crdUid": self._crd["metadata"]["uid"],
+                "crdResourceVersion": self._crd["metadata"]["resourceVersion"],
+                "crdConditions": deepcopy(self._crd["status"].get("conditions", [])),
+                "crdStatusPutCount": self._crd_status_puts,
                 "objects": items,
                 "hooks": deepcopy(self.hooks),
             }

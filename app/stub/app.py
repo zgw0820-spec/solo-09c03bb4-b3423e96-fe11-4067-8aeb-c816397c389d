@@ -12,9 +12,12 @@
 
 控制端点（演示/测试用，不是迁移接口）
   POST   /__control/reset                       恢复种子数据并清空钩子
-  GET    /__control/storage                     查看每个对象的实际存储版本等
+  GET    /__control/storage                     查看每个对象的实际存储版本、
+                                                CRD UID/conditions/状态写次数等
   POST   /__control/seed-v1beta1                以 v1beta1 编码直接写入对象
   PUT    /__control/hooks                       注入故障/并发钩子
+    （含 crdStatusConflictOnce：CRD /status 409 竞争；
+      crdRecreateOnce：同名 CRD 重建导致 UID 变化）
 """
 from __future__ import annotations
 

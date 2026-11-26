@@ -18,6 +18,10 @@ Kubernetes apiserver 按当前存储版本 v1 把对象重新落盘，最终把 
 | 版本冲突读最新再试 | PUT 收到 409 → 重新 GET 最新对象（全新 resourceVersion）后重试，上限 `MAX_CONFLICT_RETRIES`，退避递增 |
 | 已删跳过、不补建 | GET/PUT 收到 404 → 记 `skipped-deleted`，不执行任何创建动作 |
 | 全部成功才删旧标记 | 只有遍历完整 **且** 无失败对象时，才 PUT CRD `/status` 移除 `v1beta1`；CRD status 自身 409 也重读重试 |
+| 撤标只动 storedVersions | PUT `/status` 携带最新 GET 到的**完整 status**，仅从中剔除 `v1beta1`，`conditions` 等其他状态字段原样保留（真实 apiserver 会用 body.status 整体替换，只发 storedVersions 会清空 conditions） |
+| 冲突按最新状态重新判断 | CRD `/status` 收到 409 后丢弃旧快照，重新 GET 最新 CRD 再判断，绝不拿过期 resourceVersion 覆盖其他控制器刚写入的 condition/状态 |
+| 旧标记已被别处撤掉 | 重读发现 `storedVersions` 已不含 `v1beta1` 时，报告 `legacyVersionOutcome=already-absent`，不再执行任何 CRD 状态写 |
+| 同名 CRD 被重建 | 重读发现 CRD `uid` 与本轮开始时不同即报 `status=failed`（`crdUidChanged=true`），不写新 CRD 的任何状态；对象改存结果仍在报告中 |
 | 失败保留旧标记并指出出错处 | LIST 失败/对象写回失败/CRD 状态更新失败均直接返回 `status=failed` 报告，含 `error.stage`、出错对象名、分页位置与重跑提示；`storedVersions` 保持不动 |
 | 可安全重跑 | 流程幂等：已改存对象再写一次无害；旧标记已移除时只做对象改存不再动 CRD |
 
@@ -33,7 +37,7 @@ app/
     conversion.py      v1beta1 <-> v1 服务端转换（drainTimeout 字符串 <-> 整数秒）
     store.py           内存存储：分页、resourceVersion 乐观锁、status 子资源、故障钩子
     app.py             Kubernetes API 替身（FastAPI），含演示控制端点
-tests/                 16 个 pytest 用例（ASGI in-process，无需端口）
+tests/                 22 个 pytest 用例（ASGI in-process，无需端口）
 scripts/demo.sh        端到端演示脚本
 docker-compose.yml     替身(18080) + 迁移服务(18000)
 Dockerfile             单镜像，按 command 启动两个角色
@@ -47,7 +51,8 @@ docker compose up --build
 # API 替身:  http://127.0.0.1:18080
 ```
 
-另开终端运行演示（旧对象改存、并发改策略、遍历中删除、故障重跑）：
+另开终端运行演示（旧对象改存、并发改策略、遍历中删除、故障重跑、CRD 状态冲突、
+旧标记被别处撤掉、同名 CRD 重建）：
 
 ```bash
 ./scripts/demo.sh
@@ -62,7 +67,9 @@ docker compose up --build
 - `GET /migrate/last` — 最近一次报告。
 - `GET /healthz` — 健康检查。
 
-报告字段：`storedVersionsBefore/After`、`pagesProcessed`、`objectsListed`、
+报告字段：`storedVersionsBefore/After`、`legacyVersionRemoved`、
+`legacyVersionOutcome`（`removed` 本轮撤标 / `already-absent` 标记已被别处撤掉 /
+`retained` 出错保留）、`crdUidChanged`、`pagesProcessed`、`objectsListed`、
 `objectsRewritten`、`objectsSkippedDeleted`、`objectsFailed`、逐对象 `results`
 （含尝试次数、冲突重试次数）、`error.stage/message/hint`。
 
@@ -80,6 +87,14 @@ list/get/put/status/delete。另有演示控制端点（真实集群中不存在
   - `put500Once`：指定对象首次写回一次性 500（验证 5xx 重试）
   - `put500` + `repeat:true`：指定对象持续 500（验证失败保留旧标记）
   - `list500` + `repeat:true`：LIST 持续失败
+  - `crdStatusConflictOnce`：首次 CRD `/status` PUT 前让另一控制器先推进
+    resourceVersion 并返回 409；`mode=condition-write` 只追加 condition，
+    `mode=external-removal` 同时把 `v1beta1` 从 storedVersions 撤掉
+  - `crdRecreateOnce`：首次 CRD `/status` PUT 时模拟同名 CRD 被删除并重建
+    （新 UID，可用 `storedVersions` 指定新对象的标记）
+
+`GET /__control/storage` 除对象存储视图外，还返回 `crdUid`、`crdConditions`
+与 `crdStatusPutCount`（成功的 CRD 状态写次数，用来验证“没有再写状态”）。
 
 ## 手工请求示例
 
@@ -94,6 +109,20 @@ curl -s -X POST http://127.0.0.1:18000/migrate | jq .
 curl -s -X PUT http://127.0.0.1:18080/__control/hooks -H 'Content-Type: application/json' \
   -d '{"concurrentEdit": {"name": "edge-nodes", "patch": {"maxUnavailable": 7}}}'
 curl -s -X POST http://127.0.0.1:18000/migrate | jq '.results, .status'
+
+# CRD 状态冲突演示：另一控制器先写 condition，迁移 409 重读后保留该 condition 并撤标
+curl -s -X POST http://127.0.0.1:18080/__control/reset >/dev/null
+curl -s -X PUT http://127.0.0.1:18080/__control/hooks -H 'Content-Type: application/json' \
+  -d '{"crdStatusConflictOnce": {"mode": "condition-write"}}'
+curl -s -X POST http://127.0.0.1:18000/migrate | jq '{status, legacyVersionOutcome, storedVersionsAfter}'
+curl -s http://127.0.0.1:18080/__control/storage | jq '{storedVersions, crdStatusPutCount, conditionTypes: [.crdConditions[].type]}'
+
+# 同名 CRD 重建演示：UID 变化 => failed，且新 CRD 从未被本服务写状态
+curl -s -X POST http://127.0.0.1:18080/__control/reset >/dev/null
+curl -s -X PUT http://127.0.0.1:18080/__control/hooks -H 'Content-Type: application/json' \
+  -d '{"crdRecreateOnce": {"storedVersions": ["v1beta1", "v1"]}}'
+curl -s -X POST http://127.0.0.1:18000/migrate | jq '{status, crdUidChanged, error, objectsRewritten}'
+curl -s http://127.0.0.1:18080/__control/storage | jq '{storedVersions, crdStatusPutCount}'
 ```
 
 ## 本地无 Docker 运行（本仓库实测方式）
