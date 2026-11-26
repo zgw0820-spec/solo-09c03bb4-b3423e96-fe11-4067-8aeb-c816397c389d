@@ -1,0 +1,30 @@
+services:
+  # 本地 Kubernetes API 替身：实现本任务所需的 CRD / CR 读写语义
+  k8s-api-stub:
+    build: .
+    image: nmp-storage-migration:latest
+    command: uvicorn app.stub.app:app --host 0.0.0.0 --port 8080
+    ports:
+      - "18080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status==200 else 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # 节点维护策略存储版本改存服务（FastAPI）
+  migrator:
+    build: .
+    image: nmp-storage-migration:latest
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      # 迁移期间存储版本固定为 v1，客户端只走 v1 路径
+      KUBERNETES_API_URL: http://k8s-api-stub:8080
+      PAGE_LIMIT: "2"
+      MAX_CONFLICT_RETRIES: "5"
+      MAX_SERVER_RETRIES: "3"
+    ports:
+      - "18000:8000"
+    depends_on:
+      k8s-api-stub:
+        condition: service_healthy
